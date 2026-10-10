@@ -20,6 +20,7 @@ from utils.core.paths import get_injection_dir
 from utils.core.utilities import is_default_skin
 from injection.config.base_skin_tracker import start_tracking as _start_skin_tracking
 from injection.game.game_monitor import make_game_ended_callback
+from injection.loadingname.loading_name import build as build_loading_name
 
 log = get_logger()
 
@@ -46,6 +47,25 @@ class InjectionTrigger:
         self.state = state
         self.injection_manager = injection_manager
         self.skin_scraper = skin_scraper
+        self._last_refusal: Optional[tuple] = None
+
+    def _warn_refusal_once(self, reason: str, skin_id, champion_id) -> None:
+        """Warn about a refused injection once per skin/champion pair.
+
+        The loadout ticker calls trigger_injection on every tick inside the threshold
+        window and a refusal does not end the window (the player may still change the
+        selection), so without this the same WARNING repeats ~1000 times per second.
+        """
+        key = (reason, skin_id, champion_id)
+        if key == self._last_refusal:
+            return
+        self._last_refusal = key
+        log.warning(
+            "[INJECT] Refusing to inject skin %s for champion %s: %s",
+            skin_id,
+            champion_id,
+            reason,
+        )
 
     def _get_compatible_skin_ids(self, skin_id: int | str) -> set[int]:
         """Return a requested skin plus its explicitly known chroma base."""
@@ -201,11 +221,7 @@ class InjectionTrigger:
 
         skin_to_validate = effective_skin_id if (historic_active or random_active) else ui_skin_id
         if not self._skin_matches_champion(skin_to_validate, locked_champ_id):
-            log.warning(
-                "[INJECT] Refusing to inject skin %s for champion %s: champion mismatch",
-                skin_to_validate,
-                locked_champ_id,
-            )
+            self._warn_refusal_once("champion mismatch", skin_to_validate, locked_champ_id)
             return
         # Mark that we've processed the validated hovered skin.
         self.state.last_hover_written = True
@@ -257,15 +273,6 @@ class InjectionTrigger:
         log.info(f"   Loadout Timer: #{ticker_id}")
         log.info("=" * LOG_SEPARATOR_WIDTH)
 
-        # Friends get the skin injected now, not what the client shows once the
-        # base skin is forced below
-        party_manager = getattr(self.state, "party_manager", None)
-        if party_manager and getattr(party_manager, "enabled", False):
-            try:
-                party_manager.freeze_my_selection()
-            except Exception as e:
-                log.debug(f"[PARTY] Could not keep our selection for friends: {e}")
-        
         try:
             lcu_skin_id = self.state.selected_skin_id
             owned_skin_ids = self.state.owned_skin_ids
@@ -330,7 +337,8 @@ class InjectionTrigger:
                                     current_skin_id,
                                 )
                                 historic_custom_mod_path = None
-                except Exception:
+                except Exception as e:
+                    log.warning(f"[HISTORIC] Could not look up the saved custom mod: {e}")
                     historic_custom_mod_path = None
 
             if not selected_custom_mod and historic_custom_mod_path:
@@ -404,6 +412,16 @@ class InjectionTrigger:
                     log.warning(f"[HISTORIC] Failed to auto-select saved custom mod: {e}")
                     import traceback
                     log.debug(f"[HISTORIC] Traceback: {traceback.format_exc()}")
+
+            # Friends get the skin injected now, not what the client shows once the
+            # base skin is forced below. Kept after the saved custom mod is
+            # auto-selected, so friends get that mod too
+            party_manager = getattr(self.state, "party_manager", None)
+            if party_manager and getattr(party_manager, "enabled", False):
+                try:
+                    party_manager.freeze_my_selection()
+                except Exception as e:
+                    log.debug(f"[PARTY] Could not keep our selection for friends: {e}")
             
             # Auto-select saved mods (map, font, announcer, other) if not already selected
             # (These were previously only initialized when the Custom Mods UI was opened.)
@@ -974,7 +992,9 @@ class InjectionTrigger:
                                 try:
                                     full_path = mods_root / relative_path.replace("/", "\\")
                                     return full_path.exists()
-                                except Exception:
+                                except Exception as e:
+                                    # False clears the user's selection, so say why
+                                    log.warning(f"[INJECT] Could not check mod file {relative_path}: {e}")
                                     return False
                             
                             # Check and clean map mod
@@ -1210,6 +1230,20 @@ class InjectionTrigger:
             log.error(f"[INJECT] Traceback: {traceback.format_exc()}")
     
     def _inject_custom_mod(self, custom_mod: dict, base_skin_name: Optional[str] = None, champion_name: str = ""):
+        """Inject custom mod, then stop the game monitor however the injection ends.
+
+        The monitor suspends the game while mods are prepared. An injection that
+        gives up early (missing carrier archive or mod source, nothing to inject,
+        an error) must still stop it, or the game stays frozen until the
+        monitor's auto-resume timeout.
+        """
+        try:
+            self._run_custom_mod_injection(custom_mod, base_skin_name, champion_name)
+        finally:
+            if self.injection_manager:
+                self.injection_manager._stop_monitor()
+
+    def _run_custom_mod_injection(self, custom_mod: dict, base_skin_name: Optional[str] = None, champion_name: str = ""):
         """Inject custom mod from mods storage (mod should already be extracted)
         
         Args:
@@ -1467,6 +1501,21 @@ class InjectionTrigger:
                         if hasattr(self.state, 'selected_other_mod'):
                             self.state.selected_other_mod = None
             
+            # A custom skin runs as the default one too, so the loading screen gets the skin's name here as it does for a
+            # regular skin (SkinInjector.inject_skin). skin_id is the skin the mod targets; a chroma's mod targets its
+            # base skin, which is the name the game has. It never fails the injection.
+            skin_folder = mod_folder_name or carrier_mod_folder_name
+            if skin_folder and skin_id:
+                try:
+                    loading_name_mod = build_loading_name(
+                        injector.game_dir, injector.mods_dir, injector.mods_dir / skin_folder, int(skin_id)
+                    )
+                    if loading_name_mod:
+                        mod_folder_names.append(loading_name_mod)
+                        mod_names_list.append("Loading screen name")
+                except (TypeError, ValueError) as e:
+                    log.debug(f"[LOADNAME] skipped for custom mod: {e}")
+
             # Add party member skins if party mode is active
             party_manager = getattr(self.state, "party_manager", None)
             if party_manager and getattr(party_manager, "enabled", False):
@@ -1567,10 +1616,6 @@ class InjectionTrigger:
                 log.debug(f"[MOD_HISTORIC] Failed to clean up missing mods from historic: {e}")
                 import traceback
                 log.debug(f"[MOD_HISTORIC] Traceback: {traceback.format_exc()}")
-            
-            # Stop monitor after injection completes
-            if self.injection_manager:
-                self.injection_manager._stop_monitor()
             
             if result == 0:
                 log.info("=" * LOG_SEPARATOR_WIDTH)

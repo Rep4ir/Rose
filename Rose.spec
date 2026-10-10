@@ -165,6 +165,8 @@ hiddenimports = [
     'injection.overlay.process_manager',
     'injection.tools',
     'injection.tools.tools_manager',
+    'injection.loadingname',
+    'injection.loadingname.loading_name',
     'lcu',
     'lcu.core',
     'lcu.core.client',
@@ -289,7 +291,6 @@ hiddenimports = [
     'requests',
     'urllib3',
     'websocket',
-    'websocket_client',
     'websockets',
 
     # Party mode (WebSocket relay)
