@@ -2,8 +2,8 @@
 ; This creates a proper Windows installer that registers the app
 
 #define MyAppName "Rose"
-#define MyAppVersion "1.5.3"
-#define MyAppVersionInfo "1.5.3.0"
+#define MyAppVersion "1.5.5"
+#define MyAppVersionInfo "1.5.5.0"
 #define MyAppPublisher "Rose Team"
 #define MyAppURL "https://github.com/Alban1911/Rose"
 #define MyAppExeName "Rose.exe"
@@ -75,12 +75,112 @@ Filename: "{sys}\schtasks.exe"; Parameters: "/Delete /TN Rose /F"; Flags: runhid
 Type: filesandordirs; Name: "{app}\_internal"
 Type: filesandordirs; Name: "{app}\injection\overlay"
 Type: filesandordirs; Name: "{app}\injection\mods"
-; Remove user data stored in AppData
-; Rose stores user data in %LOCALAPPDATA%\Rose
-Type: filesandordirs; Name: "{localappdata}\Rose"
-; Note: State files are now stored in user data directory, not in app directory
+; %LOCALAPPDATA%\Rose is not listed here: whether it survives is a checkbox on
+; the uninstaller page, see _KeepUserData() in [Code] ([UninstallDelete] checks
+; run at install time, not when the user answers)
 
 [Code]
+var
+  { The uninstaller's keep-data checkbox. Left nil in silent mode. }
+  KeepUserDataBox: TNewCheckBox;
+
+function _UserDataFolder(): String;
+begin
+  { Rose stores user data in %LOCALAPPDATA%\Rose }
+  Result := ExpandConstant('{localappdata}\Rose');
+end;
+
+function _KeepUserData(): Boolean;
+begin
+  { No page means a silent uninstall, which removes Rose completely as it
+    always did: only a user who ticks the box keeps their data. }
+  Result := (KeepUserDataBox <> nil) and KeepUserDataBox.Checked;
+end;
+
+{ Inno Setup cannot add wizard pages to the uninstaller, so the only way to
+  offer a checkbox is to borrow the progress form's notebook for one step. }
+procedure InitializeUninstallProgressForm();
+var
+  Page: TNewNotebookPage;
+  IntroText: TNewStaticText;
+  UninstallButton: TNewButton;
+  SavedPageName, SavedPageDescription: String;
+  SavedCancelEnabled: Boolean;
+  SavedCancelModalResult: Integer;
+  SavedCancelLeft: Integer;
+  Top0, Left0, Width0: Integer;
+begin
+  if UninstallSilent then
+    Exit;
+
+  Top0 := UninstallProgressForm.StatusLabel.Top;
+  Left0 := UninstallProgressForm.StatusLabel.Left;
+  Width0 := UninstallProgressForm.StatusLabel.Width;
+
+  SavedPageName := UninstallProgressForm.PageNameLabel.Caption;
+  SavedPageDescription := UninstallProgressForm.PageDescriptionLabel.Caption;
+  SavedCancelEnabled := UninstallProgressForm.CancelButton.Enabled;
+  SavedCancelModalResult := UninstallProgressForm.CancelButton.ModalResult;
+
+  Page := TNewNotebookPage.Create(UninstallProgressForm);
+  Page.Notebook := UninstallProgressForm.InnerNotebook;
+  Page.Parent := UninstallProgressForm.InnerNotebook;
+  Page.Align := alClient;
+  UninstallProgressForm.InnerNotebook.ActivePage := Page;
+
+  IntroText := TNewStaticText.Create(UninstallProgressForm);
+  IntroText.Parent := Page;
+  IntroText.Left := Left0;
+  IntroText.Top := Top0;
+  IntroText.Width := Width0;
+  IntroText.Height := ScaleY(36);
+  IntroText.AutoSize := False;
+  IntroText.ShowAccelChar := False;
+  IntroText.Caption := 'Your settings, skin history and downloaded skins are kept unless you untick this.';
+
+  KeepUserDataBox := TNewCheckBox.Create(UninstallProgressForm);
+  KeepUserDataBox.Parent := Page;
+  KeepUserDataBox.Left := Left0;
+  KeepUserDataBox.Top := Top0 + ScaleY(48);
+  KeepUserDataBox.Width := Width0;
+  KeepUserDataBox.Caption := 'Keep my data in ' + _UserDataFolder();
+  KeepUserDataBox.Checked := True;
+
+  { The uninstaller form only has a Cancel button, on the right. Take its spot
+    for the button that continues and shift Cancel to the left of it. }
+  UninstallButton := TNewButton.Create(UninstallProgressForm);
+  UninstallButton.Parent := UninstallProgressForm;
+  UninstallButton.Width := UninstallProgressForm.CancelButton.Width;
+  UninstallButton.Height := UninstallProgressForm.CancelButton.Height;
+  UninstallButton.Left := UninstallProgressForm.CancelButton.Left;
+  UninstallButton.Top := UninstallProgressForm.CancelButton.Top;
+  UninstallButton.Caption := 'Uninstall';
+  UninstallButton.ModalResult := mrOK;
+  UninstallButton.TabOrder := UninstallProgressForm.CancelButton.TabOrder;
+
+  SavedCancelLeft := UninstallProgressForm.CancelButton.Left;
+  UninstallProgressForm.CancelButton.Left :=
+    SavedCancelLeft - UninstallButton.Width - ScaleX(10);
+  UninstallProgressForm.CancelButton.TabOrder := UninstallButton.TabOrder + 1;
+
+  UninstallProgressForm.PageNameLabel.Caption := 'Uninstall {#MyAppName}';
+  UninstallProgressForm.PageDescriptionLabel.Caption :=
+    'Tick the data you want to keep, then continue.';
+  UninstallProgressForm.CancelButton.Enabled := True;
+  UninstallProgressForm.CancelButton.ModalResult := mrCancel;
+
+  if UninstallProgressForm.ShowModal = mrCancel then
+    Abort;
+
+  { Put the standard page back for the rest of the run. }
+  UninstallButton.Visible := False;
+  UninstallProgressForm.PageNameLabel.Caption := SavedPageName;
+  UninstallProgressForm.PageDescriptionLabel.Caption := SavedPageDescription;
+  UninstallProgressForm.CancelButton.Enabled := SavedCancelEnabled;
+  UninstallProgressForm.CancelButton.ModalResult := SavedCancelModalResult;
+  UninstallProgressForm.CancelButton.Left := SavedCancelLeft;
+end;
+
 function _IsLeagueRunning(): Boolean;
 var
   WbemLocator, WMIService, Processes: Variant;
@@ -261,7 +361,7 @@ end;
 procedure _DeleteLocalAppDataRose();
 begin
   { Ensure user data is removed before running external cleanup }
-  DelTree(ExpandConstant('{localappdata}\Rose'), True, True, True);
+  DelTree(_UserDataFolder(), True, True, True);
 end;
 
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
@@ -274,7 +374,8 @@ begin
 
   if CurUninstallStep = usPostUninstall then
   begin
-    _DeleteLocalAppDataRose();
+    if not _KeepUserData then
+      _DeleteLocalAppDataRose();
     { Inno removes installed files; a shared/custom install root may also
       contain unrelated files. Remove the root only when it is empty. }
     RemoveDir(ExpandConstant('{app}'));
