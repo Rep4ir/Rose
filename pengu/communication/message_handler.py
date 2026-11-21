@@ -756,8 +756,8 @@ class MessageHandler:
 
             # Refresh the live threshold if injection manager is available
             try:
-                if hasattr(self, '_injection_manager') and self._injection_manager:
-                    self._injection_manager.refresh_injection_threshold()
+                if getattr(self, 'injection_manager', None):
+                    self.injection_manager.refresh_injection_threshold()
             except Exception as e:
                 log.warning('[SkinMonitor] Recommended threshold saved but not applied to the running injector: %s', e)
 
@@ -776,55 +776,21 @@ class MessageHandler:
                 log.debug('[SkinMonitor] Could not send diagnostics failure response: %s', send_error)
 
     def _clear_issues_categories(self, categories: set[str]) -> bool:
-        """Remove matching diagnostics entries from rose_diagnostics.txt (best-effort)."""
+        """Remove the diagnostics entries Troubleshooting shows under these categories (best-effort)."""
         try:
-            if not categories:
+            # The summaries _compute_diagnostics_errors gives each category's
+            # reports: matching the message text again would also take reports
+            # Troubleshooting shows apart (an LTK patcher refusal names a
+            # "verification failed" too)
+            summaries = {
+                "injection_threshold": "Injection Threshold → increase",
+                "monitor_timeout": "Monitor Auto-Resume Timeout → increase",
+                "disk_space": "Low Disk Space -> free up space",
+            }
+            keys = {summaries[c] for c in categories if c in summaries}
+            if not keys:
                 return False
-            p = get_user_data_dir() / "rose_diagnostics.txt"
-            if not p.exists():
-                return True
-
-            txt = p.read_text(encoding="utf-8", errors="ignore").splitlines()
-
-            # Parse file into entry blocks: ["ts | msg", optional "Fix: ..."]
-            blocks: list[tuple[str, str]] = []
-            i = 0
-            while i < len(txt):
-                line = (txt[i] or "").rstrip()
-                if " | " in line:
-                    msg = line
-                    fix = ""
-                    if i + 1 < len(txt):
-                        nxt = (txt[i + 1] or "").rstrip()
-                        if nxt.startswith("Fix:"):
-                            fix = nxt
-                            i += 1
-                    blocks.append((msg, fix))
-                i += 1
-
-            def _cat_for(msg_line: str, fix_line: str) -> str:
-                ml = (msg_line or "").lower()
-                fl = (fix_line or "").lower()
-                # Match the same categories we summarize
-                if 'not enough disk space' in ml or ('disk space' in ml and 'injection failed' in ml):
-                    return 'disk_space'
-                if "auto-resume safety" in ml or "monitor auto-resume timeout" in fl:
-                    return "monitor_timeout"
-                if "base skin forcing took longer" in ml or "injection threshold" in ml or "injection threshold" in fl or "base skin force time" in fl or "base skin confirmation" in fl or "verification failed" in ml:
-                    return "injection_threshold"
-                return "other"
-
-            kept_lines: list[str] = []
-            for msg_line, fix_line in blocks:
-                cat = _cat_for(msg_line, fix_line)
-                if cat in categories:
-                    continue
-                kept_lines.append(msg_line)
-                if fix_line:
-                    kept_lines.append(fix_line)
-
-            # Preserve trailing newline style expected by the reader
-            p.write_text("\n".join(kept_lines) + ("\n" if kept_lines else ""), encoding="utf-8", errors="ignore")
+            self._compute_diagnostics_errors(delete_keys=keys)
             return True
         except Exception as e:
             log.warning(f"[SkinMonitor] Could not clear diagnostics categories {categories}: {e}")
@@ -892,6 +858,15 @@ class MessageHandler:
                 # Filter out "not actually an error" noise
                 if "injection skipped" in ml and "base skin selected" in ml:
                     return None
+
+                # Category: a custom skin an older Rose fixed (CUSTOM_SKIN_OUTDATED)
+                if "was added with an older rose" in ml:
+                    m = re.search(r"Custom skin (.+) was added with an older Rose", msg or "")
+                    return {
+                        "code": "CUSTOM_SKIN_OUTDATED",
+                        "text": "Custom skin added with an older Rose → reinstall it",
+                        "detail": m.group(1) if m else "",
+                    }
 
                 # Parse helper(s)
                 def _extract_first_seconds(text: str) -> Optional[float]:
@@ -995,6 +970,17 @@ class MessageHandler:
                     return {
                         'code': 'LTK_ELEVATED',
                         'text': 'LTK Manager set to run as administrator -> turn it off',
+                        'detail': programs,
+                    }
+
+                # Category: Rose's own launcher set to run as administrator,
+                # which Rose could not take off itself (before the Windows
+                # account category, whose markers it also names)
+                if "can't apply skins" in ml and "ltk_launcher.exe is set to run as administrator" in ml:
+                    programs = msg.split('(', 1)[1].rsplit(')', 1)[0].strip() if '(' in msg else ''
+                    return {
+                        'code': 'LAUNCHER_ELEVATED',
+                        'text': "Rose's launcher set to run as administrator -> turn it off",
                         'detail': programs,
                     }
 
@@ -1394,6 +1380,19 @@ class MessageHandler:
         name_value = self._normalize_mod_identifier(entry.mod_name)
         return requested in {relative_value, name_value}
 
+    def _warn_if_outdated(self, selected_mod) -> None:
+        """Tell the player in Troubleshooting to add the picked custom skin
+        again when it is still as an older Rose fixed it, or this Rose could
+        not fix it (injection.baseskin.library.needs_reinstall). The skin
+        stays picked: the injection still tries it. Never raises."""
+        try:
+            from injection.baseskin.library import needs_reinstall, report_outdated
+
+            if needs_reinstall(self.mod_storage.mods_root, selected_mod.path):
+                report_outdated(selected_mod.display_name or selected_mod.mod_name)
+        except Exception as e:  # noqa: BLE001 - a warning must never fail the pick
+            log.debug(f"[SkinMonitor] Could not check whether {selected_mod.mod_name} is up to date: {e}")
+
     def _send_custom_mod_selection_result(
         self,
         payload: dict,
@@ -1610,8 +1609,8 @@ class MessageHandler:
 
         # Handle deselection (mod_id is null)
         if mod_id is None:
-            # Clear selected mod if it matches this skin, and remove extracted files so it
-            # doesn't keep injecting after being unchecked.
+            # Clear selected mod if it matches this skin. Its files stay in the mods folder:
+            # the injection links its mods from the selection itself, maybe while this runs.
             selected_custom_mod = getattr(self.shared_state, "selected_custom_mod", None)
             selected_target_skin_ids = set()
             if selected_custom_mod:
@@ -1671,7 +1670,6 @@ class MessageHandler:
                 except Exception as exc:
                     log.debug("[HISTORIC] Failed to clear saved custom mod on deselect: %s", exc)
 
-                self._take_back_custom_mod("SkinMonitor")
                 self.shared_state.selected_custom_mod = None
                 log.info(f"[SkinMonitor] Custom mod deselected for skin {skin_id}")
 
@@ -1748,9 +1746,9 @@ class MessageHandler:
                 )
                 return
 
-            # Extract mod immediately when selected (not during injection)
+            # The injection links the mod from this selection: refuse a pick it could not inject
             if not self.injection_manager:
-                log.warning("[SkinMonitor] Cannot extract mod - injection manager not available")
+                log.warning("[SkinMonitor] Cannot select mod - injection manager not available")
                 self._send_custom_mod_selection_result(
                     payload,
                     success=False,
@@ -1762,7 +1760,7 @@ class MessageHandler:
                 
             injector = self.injection_manager.injector
             if not injector:
-                log.warning("[SkinMonitor] Cannot extract mod - injector not available")
+                log.warning("[SkinMonitor] Cannot select mod - injector not available")
                 self._send_custom_mod_selection_result(
                     payload,
                     success=False,
@@ -1785,33 +1783,11 @@ class MessageHandler:
                 )
                 return
 
-            # Extract/copy mod to injection mods directory immediately
-            # Check if other mods (map/font/announcer/other) are already selected
-            # If so, don't clean - just extract the skin mod alongside them
-            selected_other_mods = getattr(self.shared_state, 'selected_other_mods', None)
-            if not selected_other_mods:
-                # Fallback to legacy single mod
-                selected_other_mod = getattr(self.shared_state, 'selected_other_mod', None)
-                if selected_other_mod:
-                    selected_other_mods = [selected_other_mod]
-            has_other_mods = (
-                (hasattr(self.shared_state, 'selected_map_mod') and self.shared_state.selected_map_mod) or
-                (hasattr(self.shared_state, 'selected_font_mod') and self.shared_state.selected_font_mod) or
-                (hasattr(self.shared_state, 'selected_announcer_mod') and self.shared_state.selected_announcer_mod) or
-                (selected_other_mods and len(selected_other_mods) > 0)
-            )
-            
-            # Only clean mods directory if no other mods are selected
-            if not has_other_mods:
-                injector._clean_mods_dir()
-            else:
-                log.info("[SkinMonitor] Other mods selected - keeping existing mods and adding skin mod")
-            
-            prepared = source.put(injector.mods_dir)
-            if prepared is None:
-                raise RuntimeError("The mod could not be linked or extracted into the injection folder")
-            log.info(f"[SkinMonitor] Prepared mod for the injection: {prepared}")
+            self._warn_if_outdated(selected_mod)
 
+            # Nothing goes into the mods folder on a pick: the injection cleans it
+            # and links the mods picked itself, and a pick made while it runs (past
+            # the threshold) would empty its folder under it
             self.shared_state.selected_custom_mod = {
                 "skin_id": int(skin_id),
                 "storage_skin_id": selected_mod.skin_id,
@@ -1837,7 +1813,7 @@ class MessageHandler:
                     log.debug(f"[SkinMonitor] Failed to broadcast historic state on custom mod selection: {e}")
             
             log.info(
-                "[SkinMonitor] Custom mod selected and extracted: %s "
+                "[SkinMonitor] Custom mod selected: %s "
                 "(target skin %s; storage skin %s)",
                 selected_mod.mod_name,
                 skin_id,
@@ -1876,8 +1852,6 @@ class MessageHandler:
         if not getattr(self.shared_state, "selected_custom_mod", None):
             return
 
-        self._take_back_custom_mod("Dismiss")
-
         # Clear historic entry so it doesn't auto-reselect
         try:
             from utils.core.historic import (
@@ -1907,18 +1881,6 @@ class MessageHandler:
                 self.shared_state.ui_skin_thread._broadcast_custom_mod_state()
         except Exception as exc:
             log.debug("[Dismiss] Failed to broadcast custom mod state: %s", exc)
-
-    def _take_back_custom_mod(self, tag: str) -> None:
-        """Take the selected custom mod back out of the injection's mods
-        folder (its source's take_back), so it does not keep injecting once
-        unpicked. Best effort: a failure is only logged under *tag*."""
-        try:
-            mod = self.shared_state.selected_custom_mod.get("source")
-            injector = getattr(self.injection_manager, "injector", None)
-            if mod is not None and injector is not None:
-                mod.take_back(injector.mods_dir)
-        except Exception as exc:
-            log.debug("[%s] Failed to take the custom mod out of the injection: %s", tag, exc)
 
     def _clear_active_selection_if_matches(self, champion_id: object, relative_path: object) -> None:
         """Clear the active/historic custom mod selection if it points at the deleted mod."""
@@ -2063,13 +2025,27 @@ class MessageHandler:
             response["error"] = error
         self._send_response(json.dumps(response))
 
-    def _clear_category_selection_if_matches(self, category: object, mod_name: object) -> None:
+    def _saved_category_identity(self, category: object, mod_name: object) -> Optional[str]:
+        """Identity of the saved category mod about to be deleted (None if unknown)."""
+        try:
+            mod = self.mod_storage.saved_mod(f"{category}/{mod_name}")
+        except Exception:
+            return None
+        identity = getattr(mod, "identity", None)
+        return identity if isinstance(identity, str) else None
+
+    def _clear_category_selection_if_matches(
+        self, category: object, mod_name: object, identity: Optional[str] = None
+    ) -> None:
         """Clear live selection and mod historic if they point at the deleted category mod."""
         if not category or not mod_name:
             return
         target = f"{category}/{mod_name}".replace("\\", "/")
-        # An archive mod is selected by its path, extension included
+        # An archive mod is selected by its path, extension included. A mod
+        # LTK Manager has not taken yet keeps its own (e.g. .modpkg) identity.
         targets = {target, f"{target}.fantome"}
+        if identity:
+            targets.add(identity.replace("\\", "/"))
 
         def _same_path(value: object) -> bool:
             return bool(value) and str(value).replace("\\", "/") in targets
@@ -2133,9 +2109,10 @@ class MessageHandler:
             }))
             return
         try:
+            identity = self._saved_category_identity(category, mod_name)
             deleted = self.mod_storage.delete_category_mod(category, mod_name)
             if deleted:
-                self._clear_category_selection_if_matches(category, mod_name)
+                self._clear_category_selection_if_matches(category, mod_name, identity)
                 log.info(
                     "[DeleteMod] Deleted category mod: category=%s, mod=%s",
                     category,
@@ -2179,9 +2156,10 @@ class MessageHandler:
                     continue
                 mod_name = mod.get("modName")
                 try:
+                    identity = self._saved_category_identity(category, mod_name)
                     deleted = self.mod_storage.delete_category_mod(category, mod_name)
                     if deleted:
-                        self._clear_category_selection_if_matches(category, mod_name)
+                        self._clear_category_selection_if_matches(category, mod_name, identity)
                         results.append({"success": True, "modName": mod_name})
                     else:
                         results.append({
@@ -2670,7 +2648,14 @@ class MessageHandler:
 
             set_config_option("General", "injection_threshold", f"{threshold:.2f}")
             log.info(f"[SkinMonitor] Injection threshold updated to {threshold:.2f}s")
-            
+
+            # Apply it to the running injector too, or a champ select in progress keeps the old countdown
+            try:
+                if getattr(self, 'injection_manager', None):
+                    self.injection_manager.refresh_injection_threshold()
+            except Exception as e:
+                log.warning('[SkinMonitor] Threshold saved but not applied to the running injector: %s', e)
+
             set_config_option("General", "monitor_auto_resume_timeout", str(monitor_auto_resume_timeout))
             log.info(f"[SkinMonitor] Monitor auto-resume timeout updated to {monitor_auto_resume_timeout}s")
 
@@ -2807,14 +2792,14 @@ class MessageHandler:
     _MOD_CHECK_BUSY_PHASES = frozenset({
         "Matchmaking", "ReadyCheck", "ChampSelect", "FINALIZATION", "GameStart", "InProgress", "Reconnect",
     })
-    # Client phases where the base-skin fix of an added skin waits until the client is idle
-    # (injection.baseskin.library): it rewrites the whole mod, which neither the countdown's
-    # staging nor a running game should share the disk with
+    # Client phases where an added skin is not matched to the base skin (injection.baseskin):
+    # the fix rewrites the whole mod, which neither the countdown's staging nor a running game
+    # should share the disk with. Rose does not fix it later: picked, it asks to be added again
     _BASE_SKIN_WAIT_PHASES = frozenset({"FINALIZATION", "GameStart", "InProgress", "Reconnect"})
 
     def _fix_base_skin(self, imported: list[dict], game_dir) -> None:
         """Make each just-imported skin match the base skin's identity (its
-        sound banks, bank units, SKN/SKL padding and championSkinName: see
+        sound banks, bank units and bank paths, rebuilt SKN/SKL and championSkinName: see
         injection.baseskin) so LTK Manager does not take it for a skinhack,
         writing the mod again only when it did not. A mod written again gets
         "baseSkin" ({"fixes": how many}). This needs the game's files, not
@@ -2881,13 +2866,14 @@ class MessageHandler:
         holds it (stored_skin_rewrite): LTK Manager's repair is written into
         its file, whose hashes its manifest records again, and it leaves LTK
         Manager. One LTK Manager will still turn off in game (a skinhack, a
-        problem it cannot repair) is not added: *remove* deletes it again, and
-        it joins *errors* with the reason. A checked mod gets the verdict as
+        problem it cannot repair) is removed again, and it joins *errors*
+        with the reason. If removal fails, report that the mod is still saved
+        and keep its verdict. A checked mod gets the verdict as
         "health"; one saved already (the same mod added again) is not checked.
         LTK Manager's check is skipped while a game wants it (_ltk_wanted_by_game:
         a queue, champion select, a game), and one running gives way when the
         client gets there: the mod stays in Rose as it was added. From the
-        countdown on, the base-skin fix waits for the client to be idle."""
+        countdown on, the base-skin fix is skipped: Rose does not fix the skin later."""
         injection_manager = getattr(self, "injection_manager", None)
         injector = getattr(injection_manager, "injector", None)
         overlay = getattr(injector, "overlay_manager", None)
@@ -2895,8 +2881,8 @@ class MessageHandler:
         injecting = bool(getattr(injection_manager, "_injection_in_progress", False))
         if skins and imported:
             if phase in self._BASE_SKIN_WAIT_PHASES or injecting:
-                log.info("[BASESKIN] The added skins are matched to the base skin once the client is idle, "
-                         "not during the countdown or a game")
+                log.info("[BASESKIN] The added skins are not matched to the base skin during the countdown "
+                         "or a game: one picked asks to be added again")
             else:
                 # Before LTK Manager's check, so its verdict is on the mod as it will be played
                 game_dir = getattr(overlay, "game_dir", None) or getattr(injector, "game_dir", None)
@@ -2932,11 +2918,18 @@ class MessageHandler:
             if result and result.get("problems"):
                 rejection = _rejected_import(item, result)
                 try:
-                    remove(item)
-                except Exception as e:  # noqa: BLE001 - kept, with the warning, rather than half removed
+                    removed = remove(item)
+                except Exception as e:  # noqa: BLE001 - the rest of the batch can still finish
                     log.warning(f"[MODCHECK] Could not remove {item.get('modName')} again: {e}")
+                    removed = False
+                if not removed:
                     item["health"] = result
                     kept.append(item)
+                    errors.append({
+                        "fileName": rejection["fileName"],
+                        "code": "ltk_cleanup_failed",
+                        "error": "LTK Manager rejected this mod, but Rose could not remove it. It is still in your library.",
+                    })
                     continue
                 log.warning(f"[MODCHECK] Not adding {item.get('modName')}: {rejection['error']}")
                 errors.append(rejection)

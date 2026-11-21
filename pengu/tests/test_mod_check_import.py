@@ -145,7 +145,19 @@ class ModCheckOnImportTests(ModCheckCase):
         kept = self.handler()._check_imported_mods(self.imported, errors, MagicMock(side_effect=OSError("in use")))
 
         self.assertEqual(kept[0]["health"], verdict)
-        self.assertEqual(errors, [])
+        self.assertEqual(errors[0]["code"], "ltk_cleanup_failed")
+
+    def test_a_rejected_mod_with_an_unsuccessful_delete_is_reported_as_still_saved(self):
+        verdict = {"health": "unrepairable", "repaired": 0, "problems": [SKINHACK]}
+        self.library.check_mod.return_value = verdict
+        errors = []
+
+        kept = self.handler()._check_imported_mods(self.imported, errors, MagicMock(return_value=False))
+
+        self.assertEqual(kept[0]["health"], verdict)
+        self.assertEqual(errors[0]["code"], "ltk_cleanup_failed")
+        self.assertIn("still in your library", errors[0]["error"])
+        self.assertTrue(self.stored.exists())
 
     def test_the_same_mod_added_again_is_another_mod_and_the_saved_one_stays_as_it_is(self):
         """LTK Manager holds it, its copy still in Rose: the mod added again
@@ -387,7 +399,8 @@ class BaseSkinFixOnImportTests(unittest.TestCase):
 
     def fixed(self, fixes=3):
         findings = SimpleNamespace(names=[("EzrealSkin21", "BaseEzreal")] * fixes, meshes=[], audio_merges=0,
-                                   unit_renames=0, notes=["name: ezreal: ..."])
+                                   unit_renames=0, bank_moves=0, event_names_unlisted=0,
+                                   notes=["name: ezreal: ..."])
         return SimpleNamespace(changed=fixes > 0, fixes=fixes, findings=findings)
 
     def check(self, instance, skins=True):

@@ -8,27 +8,40 @@ rule judges and the one Rose plays. A mod's other skin bins (a whole champion
 WAD ships them all) are left as they are: rebased, one would claim the base
 skin's mesh paths and put its own mesh there.
 
-The mod's WADs are read file by file (wad.py), never whole. The patched banks
-and padded meshes go in the champion WAD. Files come from the mod first, so a
+The mod's WADs are read file by file (wad.py), never whole. The patched and
+moved banks and the rebuilt meshes go in the champion WAD, a voice bank the mod
+ships moves inside its own locale WAD, and the game banks the skin now loads
+from new paths are listed in META/rose_sounds.json, for Rose to copy from the
+player's own WADs as it injects the skin (skin_sounds.py). Files come from the mod first, so a
 modder's own banks and meshes are the ones patched or moved, then from the
 game's WADs in champions_dir. A mod that already matches is not written again,
 and a champion whose game WAD cannot be read is left as it is.
+
+A mod can ship a WAD unpacked, as a folder (WAD/<Champion>.wad.client/<path>)
+LTK Manager packs as it installs the mod. Its files are read the same way, by
+the hash each is packed under (_FolderWad), and the fix keeps the folder: an
+edited file is written back under its own name, a new one under its path.
 """
 
 from __future__ import annotations
 
+import json
+import re
 import shutil
+import time
 import uuid
 import zipfile
+import zlib
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 from injection.mods.mod_files import ModFiles
 from utils.core.logging import get_logger
 
 from . import audio
 from .audio import PackageFiles
-from .steps import ALL_STEPS, BaseSkinSteps, Findings
+from .skin_sounds import MANIFEST as SOUND_MANIFEST
+from .steps import ALL_STEPS, BaseSkinSteps, Findings, SoundCopy
 from .wad import FileSource, GameWad, ModWad, WadError, path_hash
 
 log = get_logger()
@@ -137,6 +150,22 @@ def split_wad_name(file_name: str) -> Optional[Tuple[str, Optional[str]]]:
     return base, None
 
 
+_HASH_NAME = re.compile(r"[0-9a-fA-F]{16}")
+
+
+def folder_file_hash(inner: str) -> int:
+    """The hash a file of an unpacked WAD folder is packed under, from its
+    path in the folder: its name when that is a path hash (16 hex digits,
+    with an extension or not, at the folder's root: a WAD extractor's name
+    for a file whose path it does not know), its path's otherwise. A legacy
+    .modpkg's files are read the same way (utils.core.modpkg)."""
+    inner = inner.replace("\\", "/").strip("/")
+    stem = inner.split(".", 1)[0]
+    if "/" not in inner and _HASH_NAME.fullmatch(stem):
+        return int(stem, 16)
+    return path_hash(inner)
+
+
 # --------------------------------------------------------------------------------------
 # a mod, as an archive or as a folder
 # --------------------------------------------------------------------------------------
@@ -164,8 +193,12 @@ class _Mod:
     def names(self) -> List[str]:
         return self.files.files_under()
 
-    def wad(self, name: str) -> Optional[ModWad]:
-        """The WAD file *name*, its table read (None: stored compressed, and too big to unpack)."""
+    def wad(self, name: str) -> Optional["_Wad"]:
+        """The WAD *name*: a WAD file, its table read (None: stored
+        compressed, and too big to unpack), or an unpacked WAD folder, named
+        with a trailing slash ("WAD/Annie.wad.client/")."""
+        if name.endswith("/"):
+            return _FolderWad(self.files, name[:-1])
         span = self.files.span(name)
         if span is None:
             if self.files.size(name) > MAX_INFLATED_WAD_BYTES:
@@ -181,27 +214,46 @@ class _Mod:
         self._wads.append(wad)
         return wad
 
-    def write(self, edited: Dict[str, ModWad]) -> None:
-        """Replace the WAD files *edited* names by their new content. Every new
-        file is written, beside the mod, before anything is replaced."""
+    def write(self, edited: Dict[str, "_Wad"], files: Optional[Dict[str, bytes]] = None) -> None:
+        """Write the WADs *edited* names again: a WAD file gets its new
+        content, an unpacked WAD folder its edited and new files; and *files*
+        ({path in the mod: content}, META/rose_sounds.json). Every new file is
+        written, beside the mod, before anything is replaced."""
         def temporary() -> Path:
             return self.path.with_name(f"{IMPORT_TEMP_PREFIX}{uuid.uuid4().hex}.tmp")
 
+        packed = {name: wad for name, wad in edited.items() if isinstance(wad, ModWad)}
+        loose: Dict[str, bytes] = dict(files or {})
+        for wad in edited.values():
+            if isinstance(wad, _FolderWad):
+                loose.update(wad.changes)
         if not self.files.is_archive:
             written: List[Tuple[Path, Path]] = []
             try:
-                for name, wad in edited.items():
+                for name, wad in packed.items():
                     written.append((temporary(), self.path / name))
                     with open(written[-1][0], "wb") as out:
                         wad.write_to(out)
+                for relative, data in loose.items():
+                    written.append((temporary(), self.path / relative))
+                    written[-1][0].write_bytes(data)
                 self.close()
                 for new, target in written:
+                    target.parent.mkdir(parents=True, exist_ok=True)
                     new.replace(target)
             finally:
                 for new, _ in written:
                     new.unlink(missing_ok=True)
             return
-        by_member = {self.files.member(name).filename: wad for name, wad in edited.items()}
+        by_member = {self.files.member(name).filename: wad for name, wad in packed.items()}
+        replaced: Dict[str, bytes] = {}
+        added: List[Tuple[str, bytes]] = []
+        for relative, data in loose.items():
+            info = self.files.member(relative)
+            if info is not None:
+                replaced[info.filename] = data
+            else:
+                added.append((relative, data))
         new = temporary()
         try:
             with zipfile.ZipFile(self.path) as source, \
@@ -219,10 +271,15 @@ class _Mod:
                     if wad is not None:
                         with out.open(entry, "w", force_zip64=wad.byte_size() >= 2 ** 31) as target:
                             wad.write_to(target)
+                    elif info.filename in replaced:
+                        out.writestr(entry, replaced[info.filename])
                     else:
                         with source.open(info) as stream, \
                                 out.open(entry, "w", force_zip64=info.file_size >= 2 ** 31) as target:
                             shutil.copyfileobj(stream, target, _COPY_CHUNK)
+                for relative, data in added:
+                    out.writestr(zipfile.ZipInfo(relative, time.localtime()[:6]), data,
+                                 compress_type=zipfile.ZIP_DEFLATED)
             self.close()
             new.replace(self.path)
         except BaseException:
@@ -230,10 +287,78 @@ class _Mod:
             raise
 
 
+class _FolderFile:
+    """A file of an unpacked WAD folder, read when its content is asked for."""
+
+    __slots__ = ("_wad", "relative")
+
+    def __init__(self, wad: "_FolderWad", relative: str) -> None:
+        self._wad = wad
+        self.relative = relative
+
+    @property
+    def data(self) -> bytes:
+        return self._wad.read(self.relative)
+
+
+class _FolderWad:
+    """A WAD the mod ships unpacked (WAD/<Champion>.wad.client/<path>), read
+    and edited as the steps do a WAD file (ModWad): its files by the hash LTK
+    Manager packs each under (folder_file_hash), read when asked for. The
+    edits wait in *changes* ({path in the mod: content}) for _Mod.write: an
+    edited file keeps its name, whether a path or a hash, and a new one is
+    named by its path."""
+
+    def __init__(self, files: ModFiles, folder: str) -> None:
+        self.folder = folder
+        self._files = files
+        self._names: Dict[int, str] = {}
+        for relative in files.files_under(folder):
+            self._names.setdefault(folder_file_hash(relative[len(folder) + 1:]), relative)
+        self.changes: Dict[str, bytes] = {}
+
+    @property
+    def modified(self) -> bool:
+        return bool(self.changes)
+
+    def close(self) -> None:
+        pass  # its files are read through the mod's ModFiles
+
+    def get(self, name_hash: int) -> Optional[_FolderFile]:
+        relative = self._names.get(name_hash)
+        return _FolderFile(self, relative) if relative is not None else None
+
+    def __contains__(self, name_hash: int) -> bool:
+        return name_hash in self._names
+
+    def read(self, relative: str) -> bytes:
+        if relative in self.changes:
+            return self.changes[relative]
+        try:
+            return self._files.read(relative)
+        except (OSError, RuntimeError, NotImplementedError, zipfile.BadZipFile, zlib.error) as e:
+            raise WadError(f"{relative} does not read: {e}") from e
+
+    def put(self, name_hash: int, data: bytes) -> None:
+        """Set the content of a file the folder holds (a new one needs its path: put_path)."""
+        relative = self._names.get(name_hash)
+        if relative is None:
+            raise KeyError(f"{self.folder} holds no file {name_hash:016x}")
+        self.changes[relative] = data
+
+    def put_path(self, path: str, data: bytes) -> None:
+        """Set the content of the file at *path*: the one the folder holds under its hash, or a new one."""
+        relative = self._names.setdefault(path_hash(path), f"{self.folder}/{path.replace(chr(92), '/').lstrip('/')}")
+        self.changes[relative] = data
+
+
+_Wad = Union[ModWad, _FolderWad]
+
+
 class _ModWadFile:
     __slots__ = ("name", "locale", "wad")
 
-    def __init__(self, name: str, locale: Optional[str], wad: ModWad) -> None:
+    def __init__(self, name: str, locale: Optional[str], wad: _Wad) -> None:
         self.name = name
         self.locale = locale
         self.wad = wad
@@ -252,6 +377,9 @@ class _Files(PackageFiles):
             if found is not None:
                 return found.data
         return None
+
+    def has_main(self, name_hash: int) -> bool:
+        return any(name_hash in item.wad for item in self._mains)
 
     def locale_files(self, name_hash: int):
         out = []
@@ -283,6 +411,8 @@ class FixResult:
         self.complete = True
         self.findings = Findings()
         self.game_wads: Dict[str, List[int]] = {}
+        # The game banks the skin now loads from new paths, for META/rose_sounds.json
+        self.sound_copies: List[SoundCopy] = []
 
     @property
     def fixes(self) -> int:
@@ -302,18 +432,21 @@ def fix_mod(path: Path, game_dir: Path, steps=ALL_STEPS) -> FixResult:
         result.complete = False
         return result
     with _Mod(path) as mod:
+        # WAD files by name, unpacked WAD folders by name and a trailing slash (_Mod.wad)
         wad_names: Dict[str, Tuple[str, Optional[str]]] = {}
-        unpacked = False
+        folders = set()
         for name in mod.names():
             parts = name.split("/")
-            if len(parts) == 2 and audio.same(parts[0], "WAD"):
-                split = split_wad_name(parts[1])
-                if split is not None:
-                    wad_names[name] = split
-            elif len(parts) > 2 and audio.same(parts[0], "WAD") and parts[1].lower().endswith(WAD_SUFFIX):
-                unpacked = True
-        if unpacked:
-            log.info(f"[BASESKIN] {path.name}: unpacked WAD folders are not read, left as they are")
+            if len(parts) < 2 or not audio.same(parts[0], "WAD"):
+                continue
+            split = split_wad_name(parts[1])
+            if split is None:
+                continue
+            if len(parts) == 2:
+                wad_names[name] = split
+            elif parts[1].casefold() not in folders:
+                folders.add(parts[1].casefold())
+                wad_names[f"{parts[0]}/{parts[1]}/"] = split
 
         stems: List[str] = []
         for stem, locale in wad_names.values():
@@ -330,10 +463,38 @@ def fix_mod(path: Path, game_dir: Path, steps=ALL_STEPS) -> FixResult:
         for stem in stems:
             members = [(name, locale) for name, (other, locale) in wad_names.items() if audio.same(other, stem)]
             _fix_champion(mod, path.name, stem, members, champions_dir, result, steps, edited)
-        if edited:
-            mod.write(edited)
+        files: Dict[str, bytes] = {}
+        manifest = _sound_manifest(mod.files, result.sound_copies)
+        if manifest is not None:
+            files[SOUND_MANIFEST] = manifest
+        if edited or files:
+            mod.write(edited, files)
             result.changed = True
     return result
+
+
+def _sound_manifest(files: ModFiles, copies: List[SoundCopy]) -> Optional[bytes]:
+    """META/rose_sounds.json listing *copies* after those the mod lists
+    already (a copy to the same path replaces the old one), or None when
+    that is what the mod holds. A check of a skin fixed before finds no bank
+    to move: the list it holds stays."""
+    if not copies:
+        return None
+    listed: List[dict] = []
+    if files.is_file(SOUND_MANIFEST):
+        try:
+            document = json.loads(files.read(SOUND_MANIFEST).decode("utf-8"))
+        except (OSError, ValueError) as e:
+            log.warning(f"[BASESKIN] {SOUND_MANIFEST} unreadable, written again: {e}")
+            document = None
+        if isinstance(document, dict) and document.get("version") == 1 and isinstance(document.get("copies"), list):
+            listed = [copy for copy in document["copies"] if isinstance(copy, dict)]
+    new = [copy.to_json() for copy in copies]
+    kept = [copy for copy in listed
+            if not any(audio.same(str(copy.get("to", "")), item["to"]) for item in new)]
+    if kept + new == listed:
+        return None
+    return json.dumps({"version": 1, "copies": kept + new}, indent=2, ensure_ascii=False).encode("utf-8")
 
 
 def _fix_champion(mod: _Mod, mod_name: str, stem: str, members: List[Tuple[str, Optional[str]]],
@@ -391,7 +552,7 @@ def _fix_champion(mod: _Mod, mod_name: str, stem: str, members: List[Tuple[str, 
     # All characters together: a sub-character's sounds can sit in banks the main character's bin loads
     rebased = runner.apply_all([(character, data) for _, _, character, _, _, data in targets])
     try:
-        extras = runner.finish()
+        finished = runner.finish()
     except (OSError, ValueError) as e:
         # The bins name banks that would not ship: nothing of this champion is written
         log.warning(f"[BASESKIN] {mod_name}: the patched sound banks of {stem} could not be built ({e}); "
@@ -399,18 +560,28 @@ def _fix_champion(mod: _Mod, mod_name: str, stem: str, members: List[Tuple[str, 
         result.complete = False
         return
 
+    # A voice bank the mod ships moves inside its own locale WAD
+    locales = {item.locale: item for item in wads if item.locale is not None}
+    for extra in finished.files:
+        if extra.locale is None:
+            continue
+        if extra.locale not in locales:
+            # Only a bank of the mod's own locale WADs moves; the merge never edits a localized one
+            log.warning(f"[BASESKIN] {mod_name}: {extra.path} ({extra.locale}) has no locale WAD to go in; "
+                        f"{stem} is left as it is")
+            result.complete = False
+            return
+
     for (_, _, _, item, name_hash, data), new in zip(targets, rebased):
         if new != data:
             item.wad.put(name_hash, new)
-    for extra in extras:
-        if extra.locale is not None:
-            # The steps never edit a localized bank (audio._Sidecar): this would be a bug
-            log.warning(f"[BASESKIN] {mod_name}: {extra.path} ({extra.locale}) was edited; not added")
-            continue
-        mains[0].wad.put(path_hash(extra.path), extra.data)
-    for item in mains:
+    for extra in finished.files:
+        target = mains[0] if extra.locale is None else locales[extra.locale]
+        target.wad.put_path(extra.path, extra.data)
+    for item in wads:
         if item.wad.modified:
             edited[item.name] = item.wad
 
+    result.sound_copies.extend(finished.sound_copies)
     result.findings.extend(runner.findings)
     result.complete = result.complete and runner.complete

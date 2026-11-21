@@ -53,12 +53,6 @@ class PhaseHandler:
         from threads.handlers.champ_select_reset import note_phase_for_reset
         note_phase_for_reset(self.state, phase)
         log.info(f"[phase] Phase transition: {previous_phase} → {phase} (swiftplay={self.state.is_swiftplay_mode}, extracted={len(self.state.swiftplay_extracted_mods)}, queue={self.state.current_queue_id})")
-        try:
-            # The stored skins not yet matched to the base skin of this patch are, while the client is idle
-            from injection.baseskin.library import on_phase as fix_stored_skins_when_idle
-            fix_stored_skins_when_idle(phase, self.injection_manager, self.state)
-        except Exception as e:  # noqa: BLE001 - phase handling goes on
-            log.warning(f"[phase] Could not start checking the stored skins against the base skin: {e}")
         if phase == "Matchmaking":
             if self.state.is_swiftplay_mode:
                 log.info("[phase] Matchmaking phase detected in Swiftplay mode - triggering injection")
@@ -66,7 +60,6 @@ class PhaseHandler:
                     self.swiftplay_handler.monitor_swiftplay_matchmaking()
                     if not self.swiftplay_handler._injection_triggered:
                         self.swiftplay_handler.trigger_swiftplay_injection()
-                        self.swiftplay_handler._injection_triggered = True
         
         elif phase == "ChampSelect":
             self._sync_saved_mods_for_listing()
@@ -122,10 +115,6 @@ class PhaseHandler:
                 # Normal ChampSelect handling
                 from threads.handlers.champ_select_reset import perform_champ_select_reset
                 perform_champ_select_reset(self.state, self.lcu)
-                self.state.locked_champ_id = None
-                self.state.locked_champ_timestamp = 0.0
-                self.state.champion_exchange_triggered = False
-                self.state.own_champion_locked = False
 
                 # Backup UI initialization
                 try:
@@ -175,6 +164,7 @@ class PhaseHandler:
             if self.state.is_swiftplay_mode and self.swiftplay_handler:
                 # Check if we're still in a Swiftplay/Quickplay lobby
                 if self.state.current_queue_id in SWIFTPLAY_QUEUE_IDS:
+                    self.swiftplay_handler.discard_swiftplay_preparation()
                     log.info(f"[phase] Returned to Lobby from {previous_phase} - still in Swiftplay queue ({self.state.current_queue_id}), preserving skin tracking")
                 else:
                     log.info(f"[phase] Returned to Lobby from {previous_phase} - queue changed, cleaning up Swiftplay state")
